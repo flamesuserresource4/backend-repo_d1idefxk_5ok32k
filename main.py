@@ -1,6 +1,11 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr, Field
+from typing import Optional
+from uuid import uuid4
+from passlib.hash import bcrypt
+from database import db, create_document, get_documents
 
 app = FastAPI()
 
@@ -12,13 +17,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+class RegisterRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=80)
+    email: EmailStr
+    password: str = Field(..., min_length=6, max_length=128)
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=6, max_length=128)
+
+
+class AuthResponse(BaseModel):
+    token: str
+    user: dict
+
+
 @app.get("/")
 def read_root():
     return {"message": "Hello from FastAPI Backend!"}
 
+
 @app.get("/api/hello")
 def hello():
     return {"message": "Hello from the backend API!"}
+
 
 @app.get("/test")
 def test_database():
@@ -31,17 +55,14 @@ def test_database():
         "connection_status": "Not Connected",
         "collections": []
     }
-    
+
     try:
-        # Try to import database module
-        from database import db
-        
         if db is not None:
             response["database"] = "✅ Available"
             response["database_url"] = "✅ Configured"
             response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
             response["connection_status"] = "Connected"
-            
+
             # Try to list collections to verify connectivity
             try:
                 collections = db.list_collection_names()
@@ -51,18 +72,59 @@ def test_database():
                 response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
         else:
             response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
+
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:50]}"
-    
+
     # Check environment variables
-    import os
     response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
+
     return response
+
+
+@app.post("/auth/register", response_model=AuthResponse)
+def register(payload: RegisterRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    # Check if email already exists
+    existing = db["authuser"].find_one({"email": payload.email.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    password_hash = bcrypt.hash(payload.password)
+    user_doc = {
+        "name": payload.name.strip(),
+        "email": payload.email.lower(),
+        "password_hash": password_hash,
+        "avatar_url": None,
+    }
+
+    user_id = create_document("authuser", user_doc)
+
+    token = str(uuid4())
+    user_public = {"id": user_id, "name": user_doc["name"], "email": user_doc["email"], "avatar_url": None}
+    return {"token": token, "user": user_public}
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+def login(payload: LoginRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    user = db["authuser"].find_one({"email": payload.email.lower()})
+    if not user or not bcrypt.verify(payload.password, user.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    token = str(uuid4())
+    user_public = {
+        "id": str(user.get("_id")),
+        "name": user.get("name"),
+        "email": user.get("email"),
+        "avatar_url": user.get("avatar_url"),
+    }
+    return {"token": token, "user": user_public}
 
 
 if __name__ == "__main__":
