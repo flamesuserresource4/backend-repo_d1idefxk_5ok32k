@@ -2,10 +2,9 @@ import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
-from typing import Optional
 from uuid import uuid4
 from passlib.hash import bcrypt
-from database import db, create_document, get_documents
+from database import db, create_document
 
 app = FastAPI()
 
@@ -32,6 +31,18 @@ class LoginRequest(BaseModel):
 class AuthResponse(BaseModel):
     token: str
     user: dict
+
+
+class AdminCreateRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=80)
+    email: EmailStr
+    password: str = Field(..., min_length=8, max_length=128)
+    admin_key: str | None = Field(None, max_length=256)
+
+
+class PromoteRequest(BaseModel):
+    email: EmailStr
+    admin_key: str = Field(..., min_length=16, max_length=256)
 
 
 @app.get("/")
@@ -63,10 +74,9 @@ def test_database():
             response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
             response["connection_status"] = "Connected"
 
-            # Try to list collections to verify connectivity
             try:
                 collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
+                response["collections"] = collections[:10]
                 response["database"] = "✅ Connected & Working"
             except Exception as e:
                 response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
@@ -76,11 +86,29 @@ def test_database():
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:50]}"
 
-    # Check environment variables
     response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
 
     return response
+
+
+def _require_admin_key_if_needed(provided_key: str | None):
+    """Require ADMIN_SETUP_KEY unless this is the very first admin."""
+    admins = 0
+    try:
+        admins = db["authuser"].count_documents({"role": "admin"}) if db is not None else 0
+    except Exception:
+        admins = 0
+
+    if admins == 0:
+        # First admin bootstrap: no key required
+        return
+
+    setup_key = os.getenv("ADMIN_SETUP_KEY")
+    if not setup_key:
+        raise HTTPException(status_code=500, detail="ADMIN_SETUP_KEY not configured on server")
+    if provided_key != setup_key:
+        raise HTTPException(status_code=401, detail="Invalid admin setup key")
 
 
 @app.post("/auth/register", response_model=AuthResponse)
@@ -88,7 +116,6 @@ def register(payload: RegisterRequest):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
 
-    # Check if email already exists
     existing = db["authuser"].find_one({"email": payload.email.lower()})
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -99,12 +126,13 @@ def register(payload: RegisterRequest):
         "email": payload.email.lower(),
         "password_hash": password_hash,
         "avatar_url": None,
+        "role": "user",
     }
 
     user_id = create_document("authuser", user_doc)
 
     token = str(uuid4())
-    user_public = {"id": user_id, "name": user_doc["name"], "email": user_doc["email"], "avatar_url": None}
+    user_public = {"id": user_id, "name": user_doc["name"], "email": user_doc["email"], "avatar_url": None, "role": "user"}
     return {"token": token, "user": user_public}
 
 
@@ -123,8 +151,55 @@ def login(payload: LoginRequest):
         "name": user.get("name"),
         "email": user.get("email"),
         "avatar_url": user.get("avatar_url"),
+        "role": user.get("role", "user"),
     }
     return {"token": token, "user": user_public}
+
+
+@app.post("/auth/create-admin", response_model=AuthResponse)
+def create_admin(payload: AdminCreateRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    _require_admin_key_if_needed(payload.admin_key)
+
+    existing = db["authuser"].find_one({"email": payload.email.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already exists")
+
+    password_hash = bcrypt.hash(payload.password)
+    user_doc = {
+        "name": payload.name.strip(),
+        "email": payload.email.lower(),
+        "password_hash": password_hash,
+        "avatar_url": None,
+        "role": "admin",
+    }
+    user_id = create_document("authuser", user_doc)
+
+    token = str(uuid4())
+    user_public = {"id": user_id, "name": user_doc["name"], "email": user_doc["email"], "avatar_url": None, "role": "admin"}
+    return {"token": token, "user": user_public}
+
+
+@app.post("/auth/promote")
+def promote_to_admin(payload: PromoteRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    setup_key = os.getenv("ADMIN_SETUP_KEY")
+    if not setup_key:
+        raise HTTPException(status_code=500, detail="ADMIN_SETUP_KEY not configured on server")
+    if payload.admin_key != setup_key:
+        raise HTTPException(status_code=401, detail="Invalid admin setup key")
+
+    user = db["authuser"].find_one({"email": payload.email.lower()})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    db["authuser"].update_one({"_id": user["_id"]}, {"$set": {"role": "admin"}})
+
+    return {"status": "ok", "message": f"Promoted {payload.email} to admin"}
 
 
 if __name__ == "__main__":
